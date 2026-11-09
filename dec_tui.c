@@ -71,6 +71,7 @@ typedef struct cctv_h5e_session cctv_h5e_session;
 
 #define H5E_GRID_TAIL_GUARD 17u   /* 网格单元起点处至少要剩余这么多字节（跟随播放器判定） */
 #define H5E_TYPE1_MIN_LEN   129u  /* 短于该长度的 type1 原样透传（不网格解密、不丢 EPB） */
+#define H5E_CLASSIC_MIN_LEN 48u   /* classic 网格的最小 NAL / RBSP 长度（type5 与 type1 共用） */
 
 /* 解析密钥窗口时的有界前缀长度：只需覆盖 RBSP[0..31] 对应的 EBSP 字节。
  * 最坏情况（00 00 03 反复）下第 31 个 RBSP 字节落在偏移 48 之前，64 留足余量。 */
@@ -292,95 +293,25 @@ static int h5e_type1_fbit(uint32_t W) {
             ((1 ^ w0) & w19 & w30) ^ (w25 & w30 & (w8 ^ w19))) & 1;
 }
 
-static bool h5e_type1_is_B_step(int s) {
-    return s == 2 || s == 8 || s == 9 || s == 10;
-}
-
-/* 按 NAL 帧头 3 字节判定所属族，返回翻转掩码（bit s = 1 表示第 s 步的反馈位取反）。
- * 已知族：01 a8 xx、61 xx xx、分片头 0x9c..0x9f、分片头 0x9a/0x9b、41 88 xx；
- * 未知族返回 0（退化为最朴素的 61e020 核心）。 */
-static uint16_t h5e_type1_flip_mask_from_header(const uint8_t hdr[3]) {
-    const uint8_t b0 = hdr[0], b1 = hdr[1], b2 = hdr[2];
+/* 注入位闭式：切片头第 2、3 字节拼成 16 位字后按位反转。
+ * 第 s 步 (0..7) 注入 nal[2] 的第 (7-s) 位，第 s 步 (8..15) 注入 nal[1] 的第 (15-s) 位。
+ * 取代按帧头“家族”拟合的翻转表 + B 步常量叠加：后者只覆盖已观测到的帧头，
+ * 且 0x61 族的掩码与 nal[1] 无关，遇到未拟合的 (nal[1], nal[2]) 组合会整帧解错。 */
+static uint16_t h5e_type1_header_bits(uint8_t b1, uint8_t b2) {
+    const uint32_t w = ((uint32_t)b2 << 8) | b1;
     uint16_t m = 0;
-    if (b0 == 0x01 && b1 == 0xA8) {
-        if ((b2 >> 7) & 1) m = (uint16_t)(m | (1u << 0));
-        if ((b2 >> 6) & 1) m = (uint16_t)(m | (1u << 1));
-        if (1 ^ ((b2 >> 5) & 1)) m = (uint16_t)(m | (1u << 2));
-        if ((b2 >> 4) & 1) m = (uint16_t)(m | (1u << 3));
-        if ((b2 >> 3) & 1) m = (uint16_t)(m | (1u << 4));
-        if ((b2 >> 1) & 1) m = (uint16_t)(m | (1u << 6));
-        if ((b2 >> 0) & 1) m = (uint16_t)(m | (1u << 7));
-        m = (uint16_t)(m | (1u << 9));
-        m = (uint16_t)(m | (1u << 12));
-        return m;
-    }
-    if (b0 == 0x61) {
-        if ((b2 >> 1) & 1) m = (uint16_t)(m | (1u << 0));
-        if ((b2 >> 0) & 1) m = (uint16_t)(m | (1u << 1));
-        if (1 ^ ((b2 >> 5) & 1)) m = (uint16_t)(m | (1u << 2));
-        if ((b2 >> 3) & 1) m = (uint16_t)(m | (1u << 4));
-        if ((b2 >> 2) & 1) m = (uint16_t)(m | (1u << 5));
-        if ((b2 >> 1) & 1) m = (uint16_t)(m | (1u << 6));
-        if ((b2 >> 0) & 1) m = (uint16_t)(m | (1u << 7));
-        if ((b2 >> 3) & 1) m = (uint16_t)(m | (1u << 14));
-        if ((b2 >> 2) & 1) m = (uint16_t)(m | (1u << 15));
-        return m;
-    }
-    /* 分片头族：nal_type=1 且 b1 高半字节为 0x9，再按 b1[2] 分两个子族：
-     *   9c..9f（b1[2]=1）：s2 = b0[0]^b2[5]，s9..s12/s14 = b0[0]，s13 = 1，s15 = b1[0]
-     *   9a/9b（b1[2]=0）：s2 = ~b2[5]，   s9..s12/s14 = 1，   s13 = 0，s15 = b1[0] */
-    if ((b0 & 0x1f) == 1 && (b1 & 0xf0) == 0x90) {
-        const int t = (b1 >> 2) & 1;
-        if ((b2 >> 7) & 1) m = (uint16_t)(m | (1u << 0));
-        if ((b2 >> 6) & 1) m = (uint16_t)(m | (1u << 1));
-        int s2 = ((b0 >> 0) & 1) ^ ((b2 >> 5) & 1);
-        if (!t) s2 = 1 ^ ((b2 >> 5) & 1);
-        if (s2) m = (uint16_t)(m | (1u << 2));
-        if ((b2 >> 4) & 1) m = (uint16_t)(m | (1u << 3));
-        if ((b2 >> 3) & 1) m = (uint16_t)(m | (1u << 4));
-        if ((b2 >> 2) & 1) m = (uint16_t)(m | (1u << 5));
-        if ((b2 >> 1) & 1) m = (uint16_t)(m | (1u << 6));
-        if ((b2 >> 0) & 1) m = (uint16_t)(m | (1u << 7));
-        if (t) {
-            if ((b0 >> 0) & 1) {
-                m = (uint16_t)(m | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14));
-            }
-            m = (uint16_t)(m | (1u << 13));
-        } else {
-            m = (uint16_t)(m | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 14));
-        }
-        if ((b1 >> 0) & 1) m = (uint16_t)(m | (1u << 15));
-        return m;
-    }
-    /* SD 450 档族（帧头 41 88 b2）：b2 各位置位依次对应 s0..s7，其中 s2 取反；
-     * 9/10/12 固定置位，s14 永远清零。 */
-    if (b0 == 0x41 && b1 == 0x88) {
-        if ((b2 >> 7) & 1) m = (uint16_t)(m | (1u << 0));
-        if ((b2 >> 6) & 1) m = (uint16_t)(m | (1u << 1));
-        if (1 ^ ((b2 >> 5) & 1)) m = (uint16_t)(m | (1u << 2));
-        if ((b2 >> 4) & 1) m = (uint16_t)(m | (1u << 3));
-        if ((b2 >> 3) & 1) m = (uint16_t)(m | (1u << 4));
-        if ((b2 >> 2) & 1) m = (uint16_t)(m | (1u << 5));
-        if ((b2 >> 1) & 1) m = (uint16_t)(m | (1u << 6));
-        if ((b2 >> 0) & 1) m = (uint16_t)(m | (1u << 7));
-        m = (uint16_t)(m | (1u << 9) | (1u << 10) | (1u << 12));
-        if ((b1 >> 0) & 1) m = (uint16_t)(m | (1u << 15));
-        return m;
-    }
-    /* 未知帧头族：不翻转任何步 */
-    return 0;
+    for (int s = 0; s < 16; s++) m = (uint16_t)(m | (uint16_t)(((w >> (15 - s)) & 1u) << s));
+    return m;
 }
 
 /* G 变换主体：W = Y:X 拼成 32 位寄存器，跑 16 步。
- * 每步输出位 = fbit ^ 翻转位 ^（该步属于 B 步集合时再取反），
- * 输出按 s=0 对应最高位拼成 P1，寄存器左移并把输出位回填。
- * X/Y 是小端读出的两个 16 位单元，P1 即解密后的前 2 字节。 */
-static uint16_t h5e_type1_G_flips(uint16_t X, uint16_t Y, uint16_t flip_mask) {
+ * 每步输出位 = fbit ^ 注入位，输出按 s=0 对应最高位拼成 P1，
+ * 寄存器左移并把输出位回填。X/Y 是小端读出的两个 16 位单元，P1 即解密后的前 2 字节。 */
+static uint16_t h5e_type1_G(uint16_t X, uint16_t Y, uint16_t bits) {
     uint32_t W = (uint32_t)X | ((uint32_t)Y << 16);
     uint16_t P1 = 0;
     for (int s = 0; s < 16; s++) {
-        int fv = h5e_type1_fbit(W) ^ ((flip_mask >> s) & 1);
-        int b = fv ^ (h5e_type1_is_B_step(s) ? 1 : 0);
+        const int b = h5e_type1_fbit(W) ^ ((bits >> s) & 1);
         P1 = (uint16_t)(P1 | (b << (15 - s)));
         W = ((W << 1) | (uint32_t)b) & 0xFFFFFFFFu;
     }
@@ -394,15 +325,15 @@ static uint16_t h5e_type1_G_flips(uint16_t X, uint16_t Y, uint16_t flip_mask) {
 static size_t h5e_decrypt_type1_new(uint8_t *nal, size_t len, uint32_t stride, size_t start,
                                     size_t guard) {
     if (!nal || stride < 4 || len < H5E_TYPE1_MIN_LEN) return len;
-    /* 帧头在循环前快照，翻转掩码是它的纯函数，提出来只算一次；
+    /* 帧头在循环前快照，注入位是它的纯函数，提出来只算一次；
      * 没有任何单元能写到 RBSP[0..2]（start >= 32），所以提前算安全。 */
-    const uint8_t hdr[3] = {nal[0], nal[1], nal[2]};
-    const uint16_t flip_mask = h5e_type1_flip_mask_from_header(hdr);
+    const uint16_t bits = h5e_type1_header_bits(nal[1], nal[2]);
     size_t *epbs = NULL, nep = 0;
     if (h5e_collect_epb(nal, len, &epbs, &nep) != 0) return len;
     const size_t nr = len - nep; /* 与 dec.c 的 nr 完全相同 */
     h5e_rbsp_map m;
     h5e_rbsp_map_init(&m, epbs, nep);
+    bool any_cell = false;
     for (size_t k = 0;; k++) {
         const size_t o = start + k * (size_t)stride;
         if (o + guard > nr || o + 4 > nr) break;
@@ -410,15 +341,16 @@ static size_t h5e_decrypt_type1_new(uint8_t *nal, size_t len, uint32_t stride, s
         for (size_t b = 0; b < 4; b++) off[b] = h5e_rbsp_at(&m, o + b);
         const uint16_t X = (uint16_t)(nal[off[0]] | (nal[off[1]] << 8));
         const uint16_t Y = (uint16_t)(nal[off[2]] | (nal[off[3]] << 8));
-        const uint16_t P1 = h5e_type1_G_flips(X, Y, flip_mask);
+        const uint16_t P1 = h5e_type1_G(X, Y, bits);
         nal[off[0]] = (uint8_t)(P1 & 0xFF);
         nal[off[1]] = (uint8_t)((P1 >> 8) & 0xFF);
         nal[off[2]] = (uint8_t)(X & 0xFF);
         nal[off[3]] = (uint8_t)((X >> 8) & 0xFF);
+        any_cell = true;
     }
-    /* type1 与 type5/classic 不对称：只要存在 EPB 就丢，没有“至少解过一个单元”的条件。 */
+    /* 与 type5/classic 一致：一个单元都没解过的 NAL 原样透传，不丢 EPB。 */
     size_t out_len = len;
-    if (nep != 0) out_len = h5e_drop_epb_03(nal, len, epbs, nep);
+    if (nep != 0 && any_cell) out_len = h5e_drop_epb_03(nal, len, epbs, nep);
     free(epbs);
     return out_len;
 }
@@ -464,11 +396,11 @@ static size_t h5e_decrypt_type5_new(uint8_t *nal, size_t len, uint32_t stride) {
  * 每单元 8 字节 TEA-16，密钥取 RBSP[16:32]；尾单元要求还剩一整个 stride。
  * 至少解过一个单元才丢 EPB 03。返回处理后的 NAL 长度。 */
 static size_t h5e_decrypt_classic_grid(uint8_t *nal, size_t len) {
-    if (!nal || len < H5E_TYPE1_MIN_LEN) return len;
+    if (!nal || len < H5E_CLASSIC_MIN_LEN) return len;
     size_t *epbs = NULL, nep = 0;
     if (h5e_collect_epb(nal, len, &epbs, &nep) != 0) return len;
     const size_t nr = len - nep;
-    if (nr < H5E_TYPE1_MIN_LEN) {
+    if (nr < H5E_CLASSIC_MIN_LEN) {
         free(epbs);
         return len;
     }
@@ -532,6 +464,8 @@ static void h5e_session_on_nal(cctv_h5e_session *s, uint8_t *nal, size_t *io_len
     }
     if ((ntype != 1 && ntype != 5) || !s->should_decrypt) return;
     if (!s->new_mode) {
+        /* classic 的 type1 仍按 type1_min_len 透传；type5 只受 classic 网格的 48 字节门槛约束 */
+        if (ntype == 1 && len < s->type1_min_len) return;
         *io_len = h5e_decrypt_classic_grid(nal, len);
         return;
     }
